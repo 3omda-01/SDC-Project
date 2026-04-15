@@ -1,0 +1,7 @@
+﻿__pycache__/
+.venv/
+.env
+*.key
+data/
+models/*.h5
+models/*.tflite
