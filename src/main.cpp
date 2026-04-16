@@ -5,6 +5,10 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
@@ -37,9 +41,9 @@
 
 // -- Vibration Motor (LEDC / PWM)
 #define VIBRATION_LEDC_CHANNEL  0
-#define VIBRATION_LEDC_FREQ     5000   // Hz
-#define VIBRATION_LEDC_RES      8      // bits (0–255)
-#define VIBRATION_INTENSITY     200    // 0–255
+#define VIBRATION_LEDC_FREQ     5000
+#define VIBRATION_LEDC_RES      8
+#define VIBRATION_INTENSITY     200
 #define VIBRATION_DURATION_MS   200
 
 // -- Battery ADC
@@ -50,12 +54,20 @@
 #define BATTERY_MIN_VOLTAGE        3.0f
 #define BATTERY_MAX_VOLTAGE        4.2f
 
+// -- BLE Configuration
+#define BLE_DEVICE_NAME         "HealEdu_MVP"
+#define BLE_SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define BLE_CHAR_SENSOR_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define BLE_CHAR_COMMAND_UUID  "beb5483e-36e1-4688-b7f6-ea07361b26a8"
+#define BLE_CHAR_CONFIG_UUID   "beb5483e-36e1-4688-b7f7-ea07361b26a8"
+#define BLE_UPDATE_INTERVAL    500
+
 // -- WiFi / Firebase
-#define WIFI_SSID           "Attenio_MVP"
-#define WIFI_PASSWORD       "attenio123"
+#define WIFI_SSID           "HealEdu_MVP"
+#define WIFI_PASSWORD       "healedu123"
 #define FIREBASE_HOST       "YOUR_PROJECT.firebaseio.com"
 #define FIREBASE_SECRET     "YOUR_FIREBASE_DATABASE_SECRET"
-#define FIREBASE_PATH       "/attenio"
+#define FIREBASE_PATH       "/healedu"
 #define FIREBASE_TIMEOUT    10000
 
 // -- Update intervals (ms)
@@ -70,6 +82,122 @@
 #define HR_MAX 220
 #define SPO2_MIN 80
 #define SPO2_MAX 100
+
+// -- Edge ML Configuration
+#define ATTENTION_WINDOW_SIZE    20
+#define ATTENTION_LOW_THRESHOLD  0.4f
+#define ATTENTION_HIGH_THRESHOLD 0.7f
+#define MOTION_LOW_THRESHOLD     0.1f
+#define MOTION_HIGH_THRESHOLD    0.5f
+#define HR_REST_MIN              50
+#define HR_REST_MAX              100
+#define HR_STRESS_THRESHOLD      110
+
+// ============================================================================
+// EDGE ML MODEL - ATTENTION DETECTION
+// ============================================================================
+class AttentionModel {
+public:
+    float attentionHistory[ATTENTION_WINDOW_SIZE];
+    int historyIndex = 0;
+    int historyCount = 0;
+    float currentAttention = 1.0f;
+    float stressLevel = 0.0f;
+    bool isCalibrated = false;
+    
+    struct CalibrationData {
+        float baselineHR = 75.0f;
+        float baselineMotion = 0.0f;
+        float baselineSpO2 = 98.0f;
+    } calibration;
+
+    void update(float heartRate, float spO2, float motion) {
+        float featureHR = normalizeHeartRate(heartRate);
+        float featureMotion = normalizeMotion(motion);
+        float featureSpO2 = normalizeSpO2(spO2);
+        
+        // Simple weighted inference (real model would be a neural network)
+        // Weights: HR (40%), Motion (35%), SpO2 (25%)
+        float rawAttention = (featureHR * 0.4f) + (featureMotion * 0.35f) + (featureSpO2 * 0.25f);
+        
+        // Update rolling window
+        attentionHistory[historyIndex] = rawAttention;
+        historyIndex = (historyIndex + 1) % ATTENTION_WINDOW_SIZE;
+        if (historyCount < ATTENTION_WINDOW_SIZE) historyCount++;
+        
+        // Smoothed attention (moving average)
+        float sum = 0;
+        for (int i = 0; i < historyCount; i++) sum += attentionHistory[i];
+        currentAttention = sum / historyCount;
+        
+        // Calculate stress level
+        if (heartRate > HR_STRESS_THRESHOLD) {
+            stressLevel = (stressLevel + 0.1f > 1.0f) ? 1.0f : stressLevel + 0.1f;
+        } else if (heartRate < HR_REST_MAX) {
+            stressLevel = (stressLevel - 0.05f < 0.0f) ? 0.0f : stressLevel - 0.05f;
+        }
+    }
+
+    float getAttentionLevel() { return currentAttention; }
+    float getStressLevel() { return stressLevel; }
+    
+    int getAttentionState() {
+        if (currentAttention < ATTENTION_LOW_THRESHOLD) return 0; // LOW
+        if (currentAttention < ATTENTION_HIGH_THRESHOLD) return 1; // MEDIUM
+        return 2; // HIGH
+    }
+    
+    const char* getAttentionLabel() {
+        switch (getAttentionState()) {
+            case 0: return "LOW";
+            case 1: return "MEDIUM";
+            default: return "HIGH";
+        }
+    }
+    
+    void calibrate(float hr, float motion, float spO2) {
+        calibration.baselineHR = (calibration.baselineHR * 0.7f) + (hr * 0.3f);
+        calibration.baselineMotion = (calibration.baselineMotion * 0.7f) + (motion * 0.3f);
+        calibration.baselineSpO2 = (calibration.baselineSpO2 * 0.7f) + (spO2 * 0.3f);
+        isCalibrated = true;
+    }
+
+private:
+    inline float fabs_diff(float a, float b) { return (a > b) ? (a - b) : (b - a); }
+    
+    float normalizeHeartRate(float hr) {
+        if (hr <= 0 || !isCalibrated) {
+            if (hr > 0 && hr < HR_STRESS_THRESHOLD) return 0.8f;
+            return 0.5f;
+        }
+        float diff = fabs_diff(hr, calibration.baselineHR);
+        if (diff < 10) return 0.9f;
+        if (diff < 20) return 0.7f;
+        if (hr > HR_STRESS_THRESHOLD) return 0.3f;
+        return 0.5f;
+    }
+    
+    float normalizeMotion(float motion) {
+        if (!isCalibrated) {
+            if (motion < MOTION_LOW_THRESHOLD) return 0.6f;
+            if (motion < MOTION_HIGH_THRESHOLD) return 0.8f;
+            return 0.4f;
+        }
+        float diff = fabs_diff(motion, calibration.baselineMotion);
+        if (diff < 0.1f) return 0.9f;
+        if (diff < 0.3f) return 0.7f;
+        return 0.4f;
+    }
+    
+    float normalizeSpO2(float spO2) {
+        if (spO2 <= 0) return 0.5f;
+        if (spO2 >= 97) return 1.0f;
+        if (spO2 >= 95) return 0.8f;
+        return 0.4f;
+    }
+};
+
+AttentionModel attentionModel;
 
 // ============================================================================
 // GLOBAL OBJECTS
@@ -95,6 +223,8 @@ struct SensorData {
     int   batteryPercent    = 0;
     float avgHeartRate      = 0;
     int   totalHRSamples    = 0;
+    float attention        = 1.0f;
+    float stress            = 0.0f;
 } sensor;
 
 struct SystemState {
@@ -103,9 +233,13 @@ struct SystemState {
     bool sensorDisplay  = false;
     bool wifiConnected  = false;
     bool firebaseOK     = false;
+    bool bleConnected  = false;
+    bool bleModeActive = false;
     bool vibrating      = false;
+    bool attentionAlertEnabled = true;
     unsigned long vibrationEnd = 0;
     unsigned long sessionStart = 0;
+    unsigned long lastVibrationAlert = 0;
     String deviceId;
 } sys;
 
@@ -114,6 +248,15 @@ unsigned long lastDisplayUpdate  = 0;
 unsigned long lastBatteryCheck   = 0;
 unsigned long lastFirebaseUpdate = 0;
 unsigned long lastWifiCheck      = 0;
+unsigned long lastBLEUpdate      = 0;
+unsigned long lastAttentionCheck = 0;
+
+BLEServer* bleServer = nullptr;
+BLEService* bleService = nullptr;
+BLECharacteristic* bleSensorChar = nullptr;
+BLECharacteristic* bleCommandChar = nullptr;
+BLECharacteristic* bleConfigChar = nullptr;
+bool bleDeviceConnected = false;
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -126,11 +269,15 @@ bool initMAX30102();
 bool initMPU6050();
 bool initDisplay();
 void initWiFi();
+void initBLE();
+void handleBLECommand(const uint8_t* data, size_t length);
+void sendBLEData();
 
 void updateSensors();
 void updateMAX30102();
 void updateMPU6050();
 void updateBattery();
+void updateAttention();
 void checkWiFi();
 
 void renderDisplay();
@@ -140,6 +287,7 @@ void showErrorScreen(const char* msg);
 
 void startVibration();
 void tickVibration();
+void attentionVibration();
 
 void pushToFirebase();
 bool firebasePut(const String& path, const String& body);
@@ -149,6 +297,9 @@ String buildJSON();
 unsigned long getEpochTime();
 void logStatus();
 
+void saveSession();
+void loadSession();
+
 // ============================================================================
 // SETUP
 // ============================================================================
@@ -157,7 +308,8 @@ void setup() {
     delay(1000);
 
     Serial.println("\n==========================================");
-    Serial.println(" Attenio MVP – XIAO ESP32-C3");
+    Serial.println(" HealEdu MVP – XIAO ESP32-C3");
+    Serial.println(" Edge AI Enabled");
     Serial.println("==========================================");
 
     initDeviceId();
@@ -169,8 +321,21 @@ void setup() {
     sys.sensorMPU6050  = initMPU6050();
     sys.sensorDisplay  = initDisplay();
 
-    initWiFi();
+    // Check if BLE mode is set (stored in preferences)
+    preferences.begin("healedu", false);
+    sys.bleModeActive = preferences.getBool("bleMode", false);
+    preferences.end();
+
+    if (sys.bleModeActive) {
+        Serial.println("Mode: BLE-Only (WiFi disabled)");
+        initBLE();
+    } else {
+        initWiFi();
+        initBLE();
+    }
+    
     updateBattery();
+    loadSession();
 
     sys.sessionStart = millis();
     logStatus();
@@ -200,14 +365,24 @@ void loop() {
         lastBatteryCheck = now;
     }
 
-    if (now - lastFirebaseUpdate >= FIREBASE_UPDATE_INTERVAL) {
+    if (!sys.bleModeActive && now - lastFirebaseUpdate >= FIREBASE_UPDATE_INTERVAL) {
         pushToFirebase();
         lastFirebaseUpdate = now;
     }
 
-    if (now - lastWifiCheck >= WIFI_CHECK_INTERVAL) {
+    if (!sys.bleModeActive && now - lastWifiCheck >= WIFI_CHECK_INTERVAL) {
         checkWiFi();
         lastWifiCheck = now;
+    }
+
+    if (now - lastBLEUpdate >= BLE_UPDATE_INTERVAL) {
+        sendBLEData();
+        lastBLEUpdate = now;
+    }
+
+    if (now - lastAttentionCheck >= 1000) {
+        updateAttention();
+        lastAttentionCheck = now;
     }
 
     tickVibration();
@@ -218,10 +393,10 @@ void loop() {
 // INITIALIZATION
 // ============================================================================
 void initDeviceId() {
-    preferences.begin("attenio", false);
+    preferences.begin("healedu", false);
     sys.deviceId = preferences.getString("deviceId", "");
     if (sys.deviceId.isEmpty()) {
-        sys.deviceId = "ATTENIO_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+        sys.deviceId = "HEALEDU_" + String((uint32_t)ESP.getEfuseMac(), HEX);
         preferences.putString("deviceId", sys.deviceId);
     }
     preferences.end();
@@ -234,7 +409,6 @@ void initI2C() {
     Serial.println("I2C ready (SDA=GPIO6, SCL=GPIO7)");
 }
 
-// ESP32-C3 does not support analogWrite; use LEDC instead.
 void initVibration() {
     ledcSetup(VIBRATION_LEDC_CHANNEL, VIBRATION_LEDC_FREQ, VIBRATION_LEDC_RES);
     ledcAttachPin(VIBRATION_PIN, VIBRATION_LEDC_CHANNEL);
@@ -249,7 +423,7 @@ void initBatteryMonitor() {
 
 bool initMAX30102() {
     if (!particleSensor.begin()) {
-        Serial.println("MAX30102: NOT FOUND – check wiring");
+        Serial.println("MAX30102: NOT FOUND");
         return false;
     }
     particleSensor.sensorConfiguration(
@@ -289,6 +463,7 @@ bool initDisplay() {
 
 void initWiFi() {
     WiFi.mode(WIFI_STA);
+    WiFi.setTxPower(WIFI_TX_POWER);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.print("WiFi connecting");
 
@@ -300,7 +475,7 @@ void initWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
         sys.wifiConnected  = true;
         sys.firebaseOK     = true;
-        wifiClient.setInsecure();   // Use a CA cert in production!
+        wifiClient.setInsecure();
         timeClient.begin();
         timeClient.update();
         Serial.printf("\nWiFi OK – IP %s\n", WiFi.localIP().toString().c_str());
@@ -309,14 +484,11 @@ void initWiFi() {
         sys.firebaseOK    = false;
         Serial.println("\nWiFi FAILED – starting AP");
         WiFi.mode(WIFI_AP);
-        WiFi.softAP("Attenio_MVP", "attenio123");
+        WiFi.softAP("HealEdu_MVP", "healedu123");
         Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
     }
 }
 
-// ============================================================================
-// WiFi RECONNECTION
-// ============================================================================
 void checkWiFi() {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi lost – reconnecting...");
@@ -355,7 +527,6 @@ void updateMAX30102() {
 
     if (hrValid && rawHR >= HR_MIN && rawHR <= HR_MAX) {
         sensor.heartRate = (float)rawHR;
-        // Cumulative moving average
         sensor.totalHRSamples++;
         sensor.avgHeartRate += (sensor.heartRate - sensor.avgHeartRate)
                                / sensor.totalHRSamples;
@@ -377,7 +548,6 @@ void updateMPU6050() {
     sensor.gyroY  = mpu.getGyroY();
     sensor.gyroZ  = mpu.getGyroZ();
 
-    // Net acceleration excluding gravity (~1 g)
     float mag = sqrt(sensor.accelX * sensor.accelX
                    + sensor.accelY * sensor.accelY
                    + sensor.accelZ * sensor.accelZ) - 1.0f;
@@ -398,13 +568,40 @@ void updateBattery() {
     sensor.batteryPercent = (int)constrain(pct, 0, 100);
 }
 
+void updateAttention() {
+    attentionModel.update(sensor.heartRate, sensor.spO2, sensor.motionMag);
+    
+    if (attentionModel.historyCount > 5 && !attentionModel.isCalibrated) {
+        attentionModel.calibrate(sensor.heartRate, sensor.motionMag, sensor.spO2);
+    }
+    
+    sensor.attention = attentionModel.getAttentionLevel();
+    sensor.stress = attentionModel.getStressLevel();
+    
+    if (sys.attentionAlertEnabled && attentionModel.getAttentionState() == 0) {
+        attentionVibration();
+    }
+}
+
+// ============================================================================
+// ATTENTION-BASED VIBRATION
+// ============================================================================
+void attentionVibration() {
+    unsigned long now = millis();
+    if (now - sys.lastVibrationAlert < 30000) return;
+    
+    sys.lastVibrationAlert = now;
+    Serial.printf("Attention Alert: %s (%.0f%%) - Vibrating\n", 
+                  attentionModel.getAttentionLabel(), sensor.attention * 100);
+    startVibration();
+}
+
 // ============================================================================
 // FIREBASE
 // ============================================================================
 void pushToFirebase() {
     if (!sys.wifiConnected || !sys.firebaseOK) return;
 
-    // Use epoch time as key; fall back to millis() if NTP unavailable
     String key  = String(getEpochTime());
     String path = String(FIREBASE_PATH) + "/" + sys.deviceId + "/readings/" + key;
 
@@ -457,7 +654,6 @@ bool firebaseGet(const String& path, String& out) {
 }
 
 String buildJSON() {
-    // ArduinoJson v7: use JsonDocument (no size template needed)
     JsonDocument doc;
 
     doc["ts"]      = getEpochTime();
@@ -469,6 +665,8 @@ String buildJSON() {
     doc["motion"]  = sensor.motionMag;
     doc["bat_pct"] = sensor.batteryPercent;
     doc["bat_v"]   = sensor.batteryVoltage;
+    doc["attn"]    = sensor.attention;
+    doc["stress"]  = sensor.stress;
 
     JsonObject accel = doc["accel"].to<JsonObject>();
     accel["x"] = sensor.accelX;
@@ -489,7 +687,29 @@ unsigned long getEpochTime() {
     if (sys.wifiConnected && timeClient.isTimeSet()) {
         return (unsigned long)timeClient.getEpochTime();
     }
-    return millis() / 1000UL;   // Rough fallback (seconds since boot)
+    return millis() / 1000UL;
+}
+
+// ============================================================================
+// SESSION STORAGE
+// ============================================================================
+void saveSession() {
+    preferences.begin("healedu", false);
+    preferences.putFloat("lastHR", sensor.avgHeartRate);
+    preferences.putFloat("lastAttn", sensor.attention);
+    preferences.putInt("hrSamples", sensor.totalHRSamples);
+    preferences.putULong("sessionStart", sys.sessionStart);
+    preferences.end();
+    Serial.println("Session saved");
+}
+
+void loadSession() {
+    preferences.begin("healedu", false);
+    float lastHR = preferences.getFloat("lastHR", 0);
+    if (lastHR > 0) {
+        Serial.printf("Previous session HR: %.1f\n", lastHR);
+    }
+    preferences.end();
 }
 
 // ============================================================================
@@ -508,7 +728,7 @@ void showWelcomeScreen() {
     display.clearDisplay();
     display.setTextSize(2);
     display.setCursor(20, 16);
-    display.println("ATTENIO");
+    display.println("HEALEDU");
     display.setTextSize(1);
     display.setCursor(28, 42);
     display.println("MVP Edition");
@@ -517,7 +737,13 @@ void showWelcomeScreen() {
 
 void showMainScreen() {
     display.setTextSize(1);
-    display.println("=== ATTENIO MVP ===");
+    display.println("=== HEALEDU MVP ===");
+
+    display.print("Attn: ");
+    display.print(attentionModel.getAttentionLabel());
+    display.print(" ");
+    display.print((int)(sensor.attention * 100));
+    display.println("%");
 
     display.print("HR:   ");
     if (sensor.heartRate > 0) {
@@ -543,8 +769,8 @@ void showMainScreen() {
     display.print(sensor.batteryPercent);
     display.println(" %");
 
-    display.print("FB:   ");
-    display.println(sys.firebaseOK ? "ON" : "OFF");
+    display.print("BLE:  ");
+    display.println(sys.bleConnected ? "ON" : "OFF");
 }
 
 void showErrorScreen(const char* msg) {
@@ -558,7 +784,7 @@ void showErrorScreen(const char* msg) {
 }
 
 // ============================================================================
-// VIBRATION (LEDC / PWM – ESP32-C3 compatible)
+// VIBRATION
 // ============================================================================
 void startVibration() {
     if (sys.vibrating) return;
@@ -578,22 +804,230 @@ void tickVibration() {
 }
 
 // ============================================================================
+// BLE SERVER
+// ============================================================================
+class BLEServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        bleDeviceConnected = true;
+        sys.bleConnected = true;
+        Serial.println("BLE: Client connected");
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+        bleDeviceConnected = false;
+        sys.bleConnected = false;
+        pServer->startAdvertising();
+        Serial.println("BLE: Client disconnected");
+    }
+};
+
+class BLECommandCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string rxValue = pCharacteristic->getValue();
+        if (rxValue.length() > 0) {
+            Serial.printf("BLE Command received (%d bytes)\n", rxValue.length());
+            handleBLECommand((const uint8_t*)rxValue.data(), rxValue.length());
+        }
+    }
+};
+
+class BLEConfigCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        std::string rxValue = pCharacteristic->getValue();
+        if (rxValue.length() > 0) {
+            handleBLEConfig((const uint8_t*)rxValue.data(), rxValue.length());
+        }
+    }
+};
+
+void initBLE() {
+    BLEDevice::init(BLE_DEVICE_NAME);
+    
+    bleServer = BLEDevice::createServer();
+    bleServer->setCallbacks(new BLEServerCallbacks());
+    
+    bleService = bleServer->createService(BLE_SERVICE_UUID);
+    
+    bleSensorChar = bleService->createCharacteristic(
+        BLE_CHAR_SENSOR_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+    );
+    bleSensorChar->addDescriptor(new BLE2902());
+    
+    bleCommandChar = bleService->createCharacteristic(
+        BLE_CHAR_COMMAND_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    bleCommandChar->setCallbacks(new BLECommandCallbacks());
+    bleCommandChar->addDescriptor(new BLE2902());
+    
+    bleConfigChar = bleService->createCharacteristic(
+        BLE_CHAR_CONFIG_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_READ
+    );
+    bleConfigChar->setCallbacks(new BLEConfigCallbacks());
+    bleConfigChar->addDescriptor(new BLE2902());
+    
+    bleService->start();
+    
+    BLEAdvertising* advertising = BLEDevice::getAdvertising();
+    advertising->addServiceUUID(BLE_SERVICE_UUID);
+    advertising->setScanResponse(true);
+    advertising->setMinPreferred(0x06);
+    advertising->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+    
+    Serial.println("BLE: Server started, advertising...");
+}
+
+void handleBLEConfig(const uint8_t* data, size_t length) {
+    if (length < 1) return;
+    
+    uint8_t cmd = data[0];
+    
+    switch (cmd) {
+        case 0x10: // Enable/disable attention alerts
+            if (length >= 2) {
+                sys.attentionAlertEnabled = data[1] > 0;
+                Serial.printf("BLE Config: Attention alerts %s\n", 
+                              sys.attentionAlertEnabled ? "enabled" : "disabled");
+            }
+            break;
+        case 0x11: // Calibrate attention model
+            attentionModel.calibrate(sensor.heartRate, sensor.motionMag, sensor.spO2);
+            Serial.println("BLE Config: Model calibrated");
+            break;
+        case 0x12: // Set mode (BLE-only / WiFi+BLE)
+            if (length >= 2) {
+                sys.bleModeActive = data[1] > 0;
+                preferences.begin("healedu", false);
+                preferences.putBool("bleMode", sys.bleModeActive);
+                preferences.end();
+                Serial.printf("BLE Config: Mode set to %s\n", 
+                              sys.bleModeActive ? "BLE-only" : "WiFi+BLE");
+            }
+            break;
+        case 0x13: // Get device status
+            {
+                uint8_t status[16];
+                status[0] = 0x13;
+                status[1] = sys.sensorMAX30102 ? 1 : 0;
+                status[2] = sys.sensorMPU6050 ? 1 : 0;
+                status[3] = sys.wifiConnected ? 1 : 0;
+                status[4] = sensor.batteryPercent;
+                status[5] = (uint8_t)(sensor.attention * 100);
+                bleConfigChar->setValue(status, 6);
+                bleConfigChar->notify();
+            }
+            break;
+        default:
+            Serial.printf("BLE Config: Unknown 0x%02X\n", cmd);
+    }
+    
+    if (bleConfigChar) {
+        uint8_t ack[2] = {cmd, 0x01};
+        bleConfigChar->setValue(ack, 2);
+        bleConfigChar->notify();
+    }
+}
+
+void handleBLECommand(const uint8_t* data, size_t length) {
+    if (length < 1) return;
+    
+    uint8_t cmd = data[0];
+    
+    switch (cmd) {
+        case 0x01: // Trigger vibration
+            Serial.println("BLE: Command - Vibrate");
+            startVibration();
+            break;
+        case 0x02: // Stop vibration
+            Serial.println("BLE: Command - Stop vibration");
+            ledcWrite(VIBRATION_LEDC_CHANNEL, 0);
+            sys.vibrating = false;
+            break;
+        case 0x03: // Request sensor data
+            Serial.println("BLE: Command - Request data");
+            sendBLEData();
+            break;
+        case 0x04: // Change intensity
+            if (length >= 2) {
+                ledcWrite(VIBRATION_LEDC_CHANNEL, data[1]);
+                Serial.printf("BLE: Command - Set intensity %d\n", data[1]);
+            }
+            break;
+        case 0x05: // Save session
+            saveSession();
+            break;
+        case 0x06: // Reset attention model
+            attentionModel.historyCount = 0;
+            attentionModel.historyIndex = 0;
+            attentionModel.isCalibrated = false;
+            Serial.println("BLE: Command - Reset attention model");
+            break;
+        default:
+            Serial.printf("BLE: Unknown command 0x%02X\n", cmd);
+    }
+    
+    if (bleCommandChar) {
+        uint8_t ack[2] = {cmd, 0x01};
+        bleCommandChar->setValue(ack, 2);
+        bleCommandChar->notify();
+    }
+}
+
+void sendBLEData() {
+    if (!bleSensorChar) return;
+    
+    JsonDocument doc;
+    doc["hr"]      = sensor.heartRate;
+    doc["spo2"]    = sensor.spO2;
+    doc["motion"]  = sensor.motionMag;
+    doc["avg_hr"]  = sensor.avgHeartRate;
+    doc["hr_n"]    = sensor.totalHRSamples;
+    doc["bat_pct"] = sensor.batteryPercent;
+    doc["bat_v"]   = sensor.batteryVoltage;
+    doc["attn"]    = sensor.attention;
+    doc["attn_state"] = attentionModel.getAttentionState();
+    doc["stress"]  = sensor.stress;
+    doc["ax"]      = sensor.accelX;
+    doc["ay"]      = sensor.accelY;
+    doc["az"]      = sensor.accelZ;
+    doc["gx"]      = sensor.gyroX;
+    doc["gy"]      = sensor.gyroY;
+    doc["gz"]      = sensor.gyroZ;
+    doc["ts"]      = getEpochTime();
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    
+    std::string payload = jsonStr.c_str();
+    bleSensorChar->setValue(payload);
+    if (bleDeviceConnected) {
+        bleSensorChar->notify();
+    }
+}
+
+// ============================================================================
 // DIAGNOSTICS
 // ============================================================================
 void logStatus() {
     Serial.println("\n==========================================");
     Serial.println(" System Status");
     Serial.println("==========================================");
-    Serial.printf(" Device ID : %s\n",  sys.deviceId.c_str());
-    Serial.printf(" MAX30102  : %s\n",  sys.sensorMAX30102 ? "OK" : "FAIL");
-    Serial.printf(" MPU6050   : %s\n",  sys.sensorMPU6050  ? "OK" : "FAIL");
-    Serial.printf(" SSD1306   : %s\n",  sys.sensorDisplay  ? "OK" : "FAIL");
-    Serial.printf(" WiFi      : %s\n",  sys.wifiConnected  ? "OK" : "FAIL");
-    Serial.printf(" Firebase  : %s\n",  sys.firebaseOK     ? "OK" : "FAIL");
-    Serial.printf(" Battery   : %d%%  %.2fV\n",
+    Serial.printf(" Device ID    : %s\n",  sys.deviceId.c_str());
+    Serial.printf(" MAX30102     : %s\n",  sys.sensorMAX30102 ? "OK" : "FAIL");
+    Serial.printf(" MPU6050      : %s\n",  sys.sensorMPU6050  ? "OK" : "FAIL");
+    Serial.printf(" SSD1306      : %s\n",  sys.sensorDisplay  ? "OK" : "FAIL");
+    Serial.printf(" Mode         : %s\n",  sys.bleModeActive ? "BLE-only" : "WiFi+BLE");
+    Serial.printf(" WiFi         : %s\n",  sys.wifiConnected  ? "OK" : "FAIL");
+    Serial.printf(" BLE          : %s\n",  sys.bleConnected   ? "OK" : "ADVERTISING");
+    Serial.printf(" Firebase     : %s\n",  sys.firebaseOK     ? "OK" : "FAIL");
+    Serial.printf(" Battery      : %d%%  %.2fV\n",
                   sensor.batteryPercent, sensor.batteryVoltage);
+    Serial.printf(" Attention ML : %s\n",  attentionModel.isCalibrated ? "CALIBRATED" : "CALIBRATING");
     if (sys.wifiConnected) {
-        Serial.printf(" IP        : %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf(" IP           : %s\n", WiFi.localIP().toString().c_str());
     }
     Serial.println("==========================================\n");
 }
